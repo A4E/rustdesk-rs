@@ -115,6 +115,8 @@ enum MessageInput {
     Mouse((MouseEvent, i32)),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Key((KeyEvent, bool)),
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    Pointer((PointerDeviceEvent, i32)),
     BlockOn,
     BlockOff,
     #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
@@ -153,6 +155,7 @@ pub struct Connection {
     restart: bool,
     recording: bool,
     last_test_delay: i64,
+    network_delay: Option<u32>,
     lock_after_session_end: bool,
     show_remote_cursor: bool,
     // by peer
@@ -192,6 +195,8 @@ pub struct Connection {
     #[cfg(all(target_os = "linux", feature = "linux_headless"))]
     #[cfg(not(any(feature = "flatpak", feature = "appimage")))]
     tx_desktop_ready: mpsc::Sender<()>,
+    closed: bool,
+    delay_response_instant: Instant,
 }
 
 impl ConnInner {
@@ -289,6 +294,7 @@ impl Connection {
             restart: Connection::permission("enable-remote-restart"),
             recording: Connection::permission("enable-record-session"),
             last_test_delay: 0,
+            network_delay: None,
             lock_after_session_end: false,
             show_remote_cursor: false,
             ip: "".to_owned(),
@@ -320,8 +326,11 @@ impl Connection {
             #[cfg(all(target_os = "linux", feature = "linux_headless"))]
             #[cfg(not(any(feature = "flatpak", feature = "appimage")))]
             tx_desktop_ready: _tx_desktop_ready,
+            closed: false,
+            delay_response_instant: Instant::now(),
         };
         if !conn.on_open(addr).await {
+            conn.closed = true;
             // sleep to ensure msg got received.
             sleep(1.).await;
             return;
@@ -563,7 +572,7 @@ impl Connection {
                             match &m.union {
                                 Some(misc::Union::StopService(_)) => {
                                     conn.send_close_reason_no_retry("").await;
-                                    conn.on_close("stop service", true).await;
+                                    conn.on_close("stop service", false).await;
                                     break;
                                 }
                                 _ => {},
@@ -586,18 +595,19 @@ impl Connection {
                         break;
                     }
                     let time = get_time();
+                    let mut qos = video_service::VIDEO_QOS.lock().unwrap();
                     if time > 0 && conn.last_test_delay == 0 {
                         conn.last_test_delay = time;
                         let mut msg_out = Message::new();
-                        let qos = video_service::VIDEO_QOS.lock().unwrap();
                         msg_out.set_test_delay(TestDelay{
                             time,
-                            last_delay:qos.current_delay,
-                            target_bitrate:qos.target_bitrate,
+                            last_delay:conn.network_delay.unwrap_or_default(),
+                            target_bitrate: qos.bitrate(),
                             ..Default::default()
                         });
                         conn.inner.send(msg_out.into());
                     }
+                    qos.user_delay_response_elapsed(conn.inner.id(), conn.delay_response_instant.elapsed().as_millis());
                 }
             }
         }
@@ -617,7 +627,6 @@ impl Connection {
         );
         video_service::notify_video_frame_fetched(id, None);
         scrap::codec::Encoder::update(id, scrap::codec::EncodingUpdate::Remove);
-        video_service::VIDEO_QOS.lock().unwrap().reset();
         if conn.authorized {
             password::update_temporary_password();
         }
@@ -634,6 +643,7 @@ impl Connection {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             try_stop_record_cursor_pos();
         }
+        conn.on_close("End", true).await;
         log::info!("#{} connection loop exited", id);
     }
 
@@ -655,14 +665,17 @@ impl Connection {
                     }
                     MessageInput::Key((mut msg, press)) => {
                         // todo: press and down have similar meanings.
-                        if press && msg.mode.unwrap() == KeyboardMode::Legacy {
+                        if press && msg.mode.enum_value() == Ok(KeyboardMode::Legacy) {
                             msg.down = true;
                         }
                         handle_key(&msg);
-                        if press && msg.mode.unwrap() == KeyboardMode::Legacy {
+                        if press && msg.mode.enum_value() == Ok(KeyboardMode::Legacy) {
                             msg.down = false;
                             handle_key(&msg);
                         }
+                    }
+                    MessageInput::Pointer((msg, id)) => {
+                        handle_pointer(&msg, id);
                     }
                     MessageInput::BlockOn => {
                         if crate::platform::block_input(true) {
@@ -867,6 +880,7 @@ impl Connection {
         v["id"] = json!(Config::get_id());
         v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
         v["conn_id"] = json!(self.inner.id);
+        v["session_id"] = json!(self.lr.session_id);
         tokio::spawn(async move {
             allow_err!(Self::post_audit_async(url, v).await);
         });
@@ -948,7 +962,6 @@ impl Connection {
         let mut res = LoginResponse::new();
         let mut pi = PeerInfo {
             username: username.clone(),
-            conn_id: self.inner.id,
             version: VERSION.to_owned(),
             ..Default::default()
         };
@@ -1177,6 +1190,14 @@ impl Connection {
 
     #[inline]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn input_pointer(&self, msg: PointerDeviceEvent, conn_id: i32) {
+        self.tx_input
+            .send(MessageInput::Pointer((msg, conn_id)))
+            .ok();
+    }
+
+    #[inline]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn input_key(&self, msg: KeyEvent, press: bool) {
         self.tx_input.send(MessageInput::Key((msg, press))).ok();
     }
@@ -1228,6 +1249,7 @@ impl Connection {
             .lock()
             .unwrap()
             .retain(|_, s| s.last_recv_time.lock().unwrap().elapsed() < SESSION_TIMEOUT);
+        // last_recv_time is a mutex variable shared with connection, can be updated lively.
         if let Some(session) = session {
             if session.name == self.lr.my_name
                 && session.session_id == self.lr.session_id
@@ -1534,7 +1556,9 @@ impl Connection {
                 video_service::VIDEO_QOS
                     .lock()
                     .unwrap()
-                    .update_network_delay(new_delay);
+                    .user_network_delay(self.inner.id(), new_delay);
+                self.network_delay = Some(new_delay);
+                self.delay_response_instant = Instant::now();
             }
         } else if let Some(message::Union::SwitchSidesResponse(_s)) = msg.union {
             #[cfg(feature = "flutter")]
@@ -1572,6 +1596,14 @@ impl Connection {
                         self.input_mouse(me, self.inner.id());
                     }
                 }
+                Some(message::Union::PointerDeviceEvent(pde)) =>
+                {
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    if self.peer_keyboard_enabled() {
+                        MOUSE_MOVE_TIME.store(get_time(), Ordering::SeqCst);
+                        self.input_pointer(pde, self.inner.id());
+                    }
+                }
                 #[cfg(any(target_os = "android", target_os = "ios"))]
                 Some(message::Union::KeyEvent(..)) => {}
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1589,11 +1621,11 @@ impl Connection {
                             me.press
                         };
 
-                        let key = match me.mode.enum_value_or_default() {
-                            KeyboardMode::Map => {
+                        let key = match me.mode.enum_value() {
+                            Ok(KeyboardMode::Map) => {
                                 Some(crate::keyboard::keycode_to_rdev_key(me.chr()))
                             }
-                            KeyboardMode::Translate => {
+                            Ok(KeyboardMode::Translate) => {
                                 if let Some(key_event::Union::Chr(code)) = me.union {
                                     Some(crate::keyboard::keycode_to_rdev_key(code & 0x0000FFFF))
                                 } else {
@@ -1876,11 +1908,9 @@ impl Connection {
                             // Drop the audio sender previously.
                             drop(std::mem::replace(&mut self.audio_sender, None));
                             self.audio_sender = Some(start_audio_thread());
-                            allow_err!(self
-                                .audio_sender
+                            self.audio_sender
                                 .as_ref()
-                                .unwrap()
-                                .send(MediaData::AudioFormat(format)));
+                                .map(|a| allow_err!(a.send(MediaData::AudioFormat(format))));
                         }
                     }
                     #[cfg(feature = "flutter")]
@@ -1906,6 +1936,14 @@ impl Connection {
                             crate::plugin::handle_client_event(&p.id, &self.lr.my_id, &p.content);
                         self.send(msg).await;
                     }
+                    Some(misc::Union::FullSpeedFps(fps)) => video_service::VIDEO_QOS
+                        .lock()
+                        .unwrap()
+                        .user_full_speed_fps(self.inner.id(), fps),
+                    Some(misc::Union::AutoAdjustFps(fps)) => video_service::VIDEO_QOS
+                        .lock()
+                        .unwrap()
+                        .user_auto_adjust_fps(self.inner.id(), fps),
                     _ => {}
                 },
                 Some(message::Union::AudioFrame(frame)) => {
@@ -2020,14 +2058,14 @@ impl Connection {
                 video_service::VIDEO_QOS
                     .lock()
                     .unwrap()
-                    .update_image_quality(image_quality);
+                    .user_image_quality(self.inner.id(), image_quality);
             }
         }
         if o.custom_fps > 0 {
             video_service::VIDEO_QOS
                 .lock()
                 .unwrap()
-                .update_user_fps(o.custom_fps as _);
+                .user_custom_fps(self.inner.id(), o.custom_fps as _);
         }
         if let Some(q) = o.supported_decoding.clone().take() {
             scrap::codec::Encoder::update(self.inner.id(), scrap::codec::EncodingUpdate::New(q));
@@ -2179,6 +2217,10 @@ impl Connection {
     }
 
     async fn on_close(&mut self, reason: &str, lock: bool) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
         log::info!("#{} Connection closed: {}", self.inner.id(), reason);
         if lock && self.lock_after_session_end && self.keyboard {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -2301,6 +2343,8 @@ async fn start_ipc(
     mut _rx_desktop_ready: mpsc::Receiver<()>,
     tx_stream_ready: mpsc::Sender<()>,
 ) -> ResultType<()> {
+    use hbb_common::anyhow::anyhow;
+
     loop {
         if !crate::platform::is_prelogin() {
             break;
@@ -2394,7 +2438,7 @@ async fn start_ipc(
     }
 
     let _res = tx_stream_ready.send(()).await;
-    let mut stream = stream.unwrap();
+    let mut stream = stream.ok_or(anyhow!("none stream"))?;
     loop {
         tokio::select! {
             res = stream.next() => {
@@ -2550,6 +2594,14 @@ mod raii {
             if active_conns_lock.is_empty() {
                 video_service::try_plug_out_virtual_display();
             }
+            #[cfg(all(windows))]
+            if active_conns_lock.is_empty() {
+                crate::privacy_win_mag::stop();
+            }
+            video_service::VIDEO_QOS
+                .lock()
+                .unwrap()
+                .on_connection_close(self.0);
         }
     }
 }

@@ -176,6 +176,10 @@ class MyTheme {
   static const Color dark = Colors.black87;
   static const Color button = Color(0xFF2C8CFF);
   static const Color hoverBorder = Color(0xFF999999);
+  static const Color bordDark = Colors.white24;
+  static const Color bordLight = Colors.black26;
+  static const Color dividerDark = Colors.white38;
+  static const Color dividerLight = Colors.black38;
 
   // ListTile
   static const ListTileThemeData listTileTheme = ListTileThemeData(
@@ -288,8 +292,8 @@ class MyTheme {
     tabBarTheme: const TabBarTheme(
       labelColor: Colors.black87,
     ),
-    splashColor: Colors.transparent,
-    highlightColor: Colors.transparent,
+    splashColor: isDesktop ? Colors.transparent : null,
+    highlightColor: isDesktop ? Colors.transparent : null,
     splashFactory: isDesktop ? NoSplash.splashFactory : null,
     textButtonTheme: isDesktop
         ? TextButtonThemeData(
@@ -377,8 +381,8 @@ class MyTheme {
     scrollbarTheme: ScrollbarThemeData(
       thumbColor: MaterialStateProperty.all(Colors.grey[500]),
     ),
-    splashColor: Colors.transparent,
-    highlightColor: Colors.transparent,
+    splashColor: isDesktop ? Colors.transparent : null,
+    highlightColor: isDesktop ? Colors.transparent : null,
     splashFactory: isDesktop ? NoSplash.splashFactory : null,
     textButtonTheme: isDesktop
         ? TextButtonThemeData(
@@ -545,7 +549,7 @@ closeConnection({String? id}) {
   }
 }
 
-void window_on_top(int? id) {
+void window_on_top(int? id) async {
   if (!isDesktop) {
     return;
   }
@@ -828,6 +832,7 @@ class CustomAlertDialog extends StatelessWidget {
   const CustomAlertDialog(
       {Key? key,
       this.title,
+      this.titlePadding,
       required this.content,
       this.actions,
       this.contentPadding,
@@ -837,6 +842,7 @@ class CustomAlertDialog extends StatelessWidget {
       : super(key: key);
 
   final Widget? title;
+  final EdgeInsetsGeometry? titlePadding;
   final Widget content;
   final List<Widget>? actions;
   final double? contentPadding;
@@ -885,7 +891,7 @@ class CustomAlertDialog extends StatelessWidget {
             child: content,
           ),
           actions: actions,
-          titlePadding: MyTheme.dialogTitlePadding(),
+          titlePadding: titlePadding ?? MyTheme.dialogTitlePadding(),
           contentPadding:
               MyTheme.dialogContentPadding(actions: actions is List),
           actionsPadding: MyTheme.dialogActionsPadding(),
@@ -998,6 +1004,26 @@ Widget msgboxIcon(String type) {
 
 // title should be null
 Widget msgboxContent(String type, String title, String text) {
+  String translateText(String text) {
+    if (text.indexOf('Failed') == 0 && text.indexOf(': ') > 0) {
+      List<String> words = text.split(': ');
+      for (var i = 0; i < words.length; ++i) {
+        words[i] = translate(words[i]);
+      }
+      text = words.join(': ');
+    } else {
+      List<String> words = text.split(' ');
+      if (words.length > 1 && words[0].endsWith('_tip')) {
+        words[0] = translate(words[0]);
+        final rest = text.substring(words[0].length + 1);
+        text = '${words[0]} ${translate(rest)}';
+      } else {
+        text = translate(text);
+      }
+    }
+    return text;
+  }
+
   return Row(
     children: [
       msgboxIcon(type),
@@ -1009,7 +1035,7 @@ Widget msgboxContent(String type, String title, String text) {
               translate(title),
               style: TextStyle(fontSize: 21),
             ).marginOnly(bottom: 10),
-            Text(translate(text), style: const TextStyle(fontSize: 15)),
+            Text(translateText(text), style: const TextStyle(fontSize: 15)),
           ],
         ),
       ),
@@ -1243,6 +1269,19 @@ String bool2option(String option, bool b) {
   return res;
 }
 
+mainSetBoolOption(String key, bool value) async {
+  String v = bool2option(key, value);
+  await bind.mainSetOption(key: key, value: v);
+}
+
+Future<bool> mainGetBoolOption(String key) async {
+  return option2bool(key, await bind.mainGetOption(key: key));
+}
+
+bool mainGetBoolOptionSync(String key) {
+  return option2bool(key, bind.mainGetOptionSync(key: key));
+}
+
 Future<bool> matchPeer(String searchText, Peer peer) async {
   if (searchText.isEmpty) {
     return true;
@@ -1311,7 +1350,7 @@ class LastWindowPosition {
       return LastWindowPosition(m["width"], m["height"], m["offsetWidth"],
           m["offsetHeight"], m["isMaximized"]);
     } catch (e) {
-      debugPrintStack(label: e.toString());
+      debugPrintStack(label: 'Failed to load LastWindowPosition "$content" ${e.toString()}');
       return null;
     }
   }
@@ -1324,15 +1363,19 @@ Future<void> saveWindowPosition(WindowType type, {int? windowId}) async {
     debugPrint(
         "Error: windowId cannot be null when saving positions for sub window");
   }
+
+  late Offset position;
+  late Size sz;
+  late bool isMaximized;
   switch (type) {
     case WindowType.Main:
-      final position = await windowManager.getPosition();
-      final sz = await windowManager.getSize();
-      final isMaximized = await windowManager.isMaximized();
-      final pos = LastWindowPosition(
-          sz.width, sz.height, position.dx, position.dy, isMaximized);
-      await bind.setLocalFlutterConfig(
-          k: kWindowPrefix + type.name, v: pos.toString());
+      position = await windowManager.getPosition();
+      if (position.dx < 0 || position.dy < 0) {
+        debugPrint("Main window is hidden, ignoring position restoration");
+        return;
+      }
+      sz = await windowManager.getSize();
+      isMaximized = await windowManager.isMaximized();
       break;
     default:
       final wc = WindowController.fromWindowId(windowId!);
@@ -1343,17 +1386,22 @@ Future<void> saveWindowPosition(WindowType type, {int? windowId}) async {
         debugPrint("Failed to get frame of window $windowId, it may be hidden");
         return;
       }
-      final position = frame.topLeft;
-      final sz = frame.size;
-      final isMaximized = await wc.isMaximized();
-      final pos = LastWindowPosition(
-          sz.width, sz.height, position.dx, position.dy, isMaximized);
-      debugPrint(
-          "saving frame: $windowId: ${pos.width}/${pos.height}, offset:${pos.offsetWidth}/${pos.offsetHeight}");
-      await bind.setLocalFlutterConfig(
-          k: kWindowPrefix + type.name, v: pos.toString());
+      position = frame.topLeft;
+      if (position.dx < 0 || position.dy < 0) {
+        debugPrint("Window $windowId is hidden, ignoring position restoration");
+        return;
+      }
+      sz = frame.size;
+      isMaximized = await wc.isMaximized();
       break;
   }
+
+  final pos = LastWindowPosition(
+      sz.width, sz.height, position.dx, position.dy, isMaximized);
+  debugPrint(
+      "Saving frame: $windowId: ${pos.width}/${pos.height}, offset:${pos.offsetWidth}/${pos.offsetHeight}");
+  await bind.setLocalFlutterConfig(
+      k: kWindowPrefix + type.name, v: pos.toString());
 }
 
 Future<Size> _adjustRestoreMainWindowSize(double? width, double? height) async {
@@ -1444,6 +1492,11 @@ Future<Offset?> _adjustRestoreMainWindowOffset(
 /// Restore window position and size on start
 /// Note that windowId must be provided if it's subwindow
 Future<bool> restoreWindowPosition(WindowType type, {int? windowId}) async {
+  if (bind
+      .mainGetEnv(key: "DISABLE_RUSTDESK_RESTORE_WINDOW_POSITION")
+      .isNotEmpty) {
+    return false;
+  }
   if (type != WindowType.Main && windowId == null) {
     debugPrint(
         "Error: windowId cannot be null when saving positions for sub window");
@@ -1511,7 +1564,7 @@ Future<bool> initUniLinks() async {
     if (initialLink == null) {
       return false;
     }
-    return parseRustdeskUri(initialLink);
+    return handleUriLink(uriString: initialLink);
   } catch (err) {
     debugPrintStack(label: "$err");
     return false;
@@ -1532,7 +1585,7 @@ StreamSubscription? listenUniLinks({handleByFlutter = true}) {
     debugPrint("A uri was received: $uri.");
     if (uri != null) {
       if (handleByFlutter) {
-        callUniLinksUriHandler(uri);
+        handleUriLink(uri: uri);
       } else {
         bind.sendUrlScheme(url: uri.toString());
       }
@@ -1545,90 +1598,147 @@ StreamSubscription? listenUniLinks({handleByFlutter = true}) {
   return sub;
 }
 
-/// Handle command line arguments
-///
-/// * Returns true if we successfully handle the startup arguments.
-bool checkArguments() {
-  if (kBootArgs.isNotEmpty) {
-    final ret = parseRustdeskUri(kBootArgs.first);
-    if (ret) {
-      return true;
+enum UriLinkType {
+  remoteDesktop,
+  fileTransfer,
+  portForward,
+  rdp,
+}
+
+// uri link handler
+bool handleUriLink({List<String>? cmdArgs, Uri? uri, String? uriString}) {
+  List<String>? args;
+  if (cmdArgs != null) {
+    args = cmdArgs;
+    // rustdesk <uri link>
+    if (args.isNotEmpty && args[0].startsWith(kUniLinksPrefix)) {
+      final uri = Uri.tryParse(args[0]);
+      if (uri != null) {
+        args = urlLinkToCmdArgs(uri);
+      }
+    }
+  } else if (uri != null) {
+    args = urlLinkToCmdArgs(uri);
+  } else if (uriString != null) {
+    final uri = Uri.tryParse(uriString);
+    if (uri != null) {
+      args = urlLinkToCmdArgs(uri);
     }
   }
-  // bootArgs:[--connect, 362587269, --switch_uuid, e3d531cc-5dce-41e0-bd06-5d4a2b1eec05]
-  // check connect args
-  var connectIndex = kBootArgs.indexOf("--connect");
-  if (connectIndex == -1) {
-    return false;
-  }
-  String? id =
-      kBootArgs.length <= connectIndex + 1 ? null : kBootArgs[connectIndex + 1];
-  String? password =
-      kBootArgs.length <= connectIndex + 2 ? null : kBootArgs[connectIndex + 2];
-  if (password != null && password.startsWith("--")) {
-    password = null;
-  }
-  final switchUuidIndex = kBootArgs.indexOf("--switch_uuid");
-  String? switchUuid = kBootArgs.length <= switchUuidIndex + 1
-      ? null
-      : kBootArgs[switchUuidIndex + 1];
-  if (id != null) {
-    if (id.startsWith(kUniLinksPrefix)) {
-      return parseRustdeskUri(id);
-    } else {
-      // remove "--connect xxx" in the `bootArgs` array
-      kBootArgs.removeAt(connectIndex);
-      kBootArgs.removeAt(connectIndex);
-      // fallback to peer id
-      Future.delayed(Duration.zero, () {
-        rustDeskWinManager.newRemoteDesktop(id,
-            password: password, switch_uuid: switchUuid);
-      });
-      return true;
+  if (args == null) return false;
+
+  UriLinkType? type;
+  String? id;
+  String? password;
+  String? switchUuid;
+  bool? forceRelay;
+  for (int i = 0; i < args.length; i++) {
+    switch (args[i]) {
+      case '--connect':
+      case '--play':
+        type = UriLinkType.remoteDesktop;
+        id = args[i + 1];
+        i++;
+        break;
+      case '--file-transfer':
+        type = UriLinkType.fileTransfer;
+        id = args[i + 1];
+        i++;
+        break;
+      case '--port-forward':
+        type = UriLinkType.portForward;
+        id = args[i + 1];
+        i++;
+        break;
+      case '--rdp':
+        type = UriLinkType.rdp;
+        id = args[i + 1];
+        i++;
+        break;
+      case '--password':
+        password = args[i + 1];
+        i++;
+        break;
+      case '--switch_uuid':
+        switchUuid = args[i + 1];
+        i++;
+        break;
+      case '--relay':
+        forceRelay = true;
+        break;
+      default:
+        break;
     }
   }
+  if (type != null && id != null) {
+    switch (type) {
+      case UriLinkType.remoteDesktop:
+        Future.delayed(Duration.zero, () {
+          rustDeskWinManager.newRemoteDesktop(id!,
+              password: password,
+              switch_uuid: switchUuid,
+              forceRelay: forceRelay);
+        });
+        break;
+      case UriLinkType.fileTransfer:
+        Future.delayed(Duration.zero, () {
+          rustDeskWinManager.newFileTransfer(id!,
+              password: password, forceRelay: forceRelay);
+        });
+        break;
+      case UriLinkType.portForward:
+        Future.delayed(Duration.zero, () {
+          rustDeskWinManager.newPortForward(id!, false,
+              password: password, forceRelay: forceRelay);
+        });
+        break;
+      case UriLinkType.rdp:
+        Future.delayed(Duration.zero, () {
+          rustDeskWinManager.newPortForward(id!, true,
+              password: password, forceRelay: forceRelay);
+        });
+        break;
+    }
+
+    return true;
+  }
+
   return false;
 }
 
-/// Parse `rustdesk://` unilinks
-///
-/// Returns true if we successfully handle the uri provided.
-/// [Functions]
-/// 1. New Connection: rustdesk://connection/new/your_peer_id
-bool parseRustdeskUri(String uriPath) {
-  final uri = Uri.tryParse(uriPath);
-  if (uri == null) {
-    debugPrint("uri is not valid: $uriPath");
-    return false;
-  }
-  return callUniLinksUriHandler(uri);
-}
-
-/// uri handler
-///
-/// Returns true if we successfully handle the uri provided.
-bool callUniLinksUriHandler(Uri uri) {
-  debugPrint("uni links called: $uri");
-  // new connection
-  String peerId;
+List<String>? urlLinkToCmdArgs(Uri uri) {
+  String? command;
+  String? id;
   if (uri.authority == "connection" && uri.path.startsWith("/new/")) {
-    peerId = uri.path.substring("/new/".length);
-  } else if (uri.authority == "connect") {
-    peerId = uri.path.substring(1);
+    // For compatibility
+    command = '--connect';
+    id = uri.path.substring("/new/".length);
+  } else if (['connect', "play", 'file-transfer', 'port-forward', 'rdp']
+      .contains(uri.authority)) {
+    command = '--${uri.authority}';
+    if (uri.path.length > 1) {
+      id = uri.path.substring(1);
+    }
   } else if (uri.authority.length > 2 && uri.path.length <= 1) {
-    // "/" or ""
-    peerId = uri.authority;
-  } else {
-    return false;
+    // rustdesk://<connect-id>
+    command = '--connect';
+    id = uri.authority;
   }
-  var param = uri.queryParameters;
-  String? switch_uuid = param["switch_uuid"];
-  String? password = param["password"];
-  Future.delayed(Duration.zero, () {
-    rustDeskWinManager.newRemoteDesktop(peerId,
-        password: password, switch_uuid: switch_uuid);
-  });
-  return true;
+
+  List<String> args = List.empty(growable: true);
+  if (command != null && id != null) {
+    args.add(command);
+    args.add(id);
+    var param = uri.queryParameters;
+    String? password = param["password"];
+    if (password != null) args.addAll(['--password', password]);
+    String? switch_uuid = param["switch_uuid"];
+    if (switch_uuid != null) args.addAll(['--switch_uuid', switch_uuid]);
+    if (param["relay"] != null) args.add("--relay");
+    return args;
+  }
+
+  return null;
 }
 
 connectMainDesktop(String id,
@@ -1763,10 +1873,14 @@ Future<void> onActiveWindowChanged() async {
   if (rustDeskWinManager.getActiveWindows().isEmpty) {
     // close all sub windows
     try {
-      await Future.wait([
-        saveWindowPosition(WindowType.Main),
-        rustDeskWinManager.closeAllSubWindows()
-      ]);
+      if (Platform.isLinux) {
+        await Future.wait([
+          saveWindowPosition(WindowType.Main),
+          rustDeskWinManager.closeAllSubWindows()
+        ]);
+      } else {
+        await rustDeskWinManager.closeAllSubWindows();
+      }
     } catch (err) {
       debugPrintStack(label: "$err");
     } finally {
@@ -2073,4 +2187,65 @@ Future<void> start_service(bool is_start) async {
   if (checked) {
     bind.mainSetOption(key: "stop-service", value: is_start ? "" : "Y");
   }
+}
+
+typedef Future<bool> WhetherUseRemoteBlock();
+Widget buildRemoteBlock({required Widget child, WhetherUseRemoteBlock? use}) {
+  var block = false.obs;
+  return Obx(() => MouseRegion(
+        onEnter: (_) async {
+          if (use != null && !await use()) {
+            block.value = false;
+            return;
+          }
+          var time0 = DateTime.now().millisecondsSinceEpoch;
+          await bind.mainCheckMouseTime();
+          Timer(const Duration(milliseconds: 120), () async {
+            var d = time0 - await bind.mainGetMouseTime();
+            if (d < 120) {
+              block.value = true;
+            }
+          });
+        },
+        onExit: (event) => block.value = false,
+        child: Stack(children: [
+          child,
+          Offstage(
+              offstage: !block.value,
+              child: Container(
+                color: Colors.black.withOpacity(0.5),
+              )),
+        ]),
+      ));
+}
+
+Widget unreadMessageCountBuilder(RxInt? count,
+    {double? size, double? fontSize}) {
+  return Obx(() => Offstage(
+      offstage: !((count?.value ?? 0) > 0),
+      child: Container(
+        width: size ?? 16,
+        height: size ?? 16,
+        decoration: BoxDecoration(
+          color: Colors.red,
+          shape: BoxShape.circle,
+        ),
+        child: Center(
+          child: Text("${count?.value ?? 0}",
+              maxLines: 1,
+              style: TextStyle(color: Colors.white, fontSize: fontSize ?? 10)),
+        ),
+      )));
+}
+
+Widget unreadTopRightBuilder(RxInt? count, {Widget? icon}) {
+  return Stack(
+    children: [
+      icon ?? Icon(Icons.chat),
+      Positioned(
+          top: 0,
+          right: 0,
+          child: unreadMessageCountBuilder(count, size: 12, fontSize: 8))
+    ],
+  );
 }
